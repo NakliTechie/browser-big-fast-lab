@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>browser-big-fast lab — single-model runner</title>
+<style>
+  body { background:#14161a; color:#e8e6e3; font:14px/1.6 ui-monospace, Menlo, monospace; margin:24px; max-width:900px; }
+  h3 { font-weight:600; }
+  pre { background:#1b1e25; border:1px solid #2a2e37; border-radius:8px; padding:14px; white-space:pre-wrap; word-break:break-word; }
+  .ok { color:#9ece6a; } .bad { color:#f7768e; } .dim { color:#8a8f98; } .warn { color:#e0af68; }
+  button { background:#7aa2f7; color:#10131a; border:0; border-radius:8px; padding:8px 18px; font:inherit; font-weight:600; cursor:pointer; }
+</style>
+</head>
+<body>
+<h3>single-model runner <span class="dim">— one onnx-community AR model, WebGPU, one page-load (Track Q atom)</span></h3>
+<pre id="out">starting…</pre>
+
+<script type="module">
+// The reusable AR atom for the lab harness. ONE model per page-load (kohra lesson:
+// multiple ORT-web/WebGPU contexts in one page contend and tank throughput). Measures
+// load / TTFT / tok/s / coherence and stamps adapter info so we KNOW it's real Metal
+// WebGPU, not a SwiftShader software fallback (which would make any q4 verdict meaningless).
+// Doubles as the T0 keystone probe: does onnx-community dense q4 compute correctly on this GPU?
+import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@4/+esm';
+
+const out = document.getElementById('out');
+const log = (s, cls) => { out.innerHTML += `\n${cls ? `<span class="${cls}">${s}</span>` : s}`; };
+
+const p = new URLSearchParams(location.search);
+const MODEL  = p.get('model')  ?? 'onnx-community/Qwen3-0.6B-ONNX';
+const DTYPE  = p.get('dtype')  ?? 'q4f16';
+const PROMPT = p.get('prompt') ?? 'The capital of France is';
+const MAXNEW = +(p.get('max')  ?? 64);
+const THINK  = p.get('think') === '1';           // Qwen3 hybrid reasoning toggle (soft switch)
+const AUTO   = p.get('auto') !== '0';            // auto-run on load (default on, for headless reads)
+
+// crude coherence check: real words, not the same token repeated / empty / mojibake
+function looksCoherent(text) {
+  const t = (text || '').trim();
+  if (t.length < 8) return false;
+  const words = t.split(/\s+/);
+  const uniq = new Set(words.map(w => w.toLowerCase()));
+  const repeatRatio = uniq.size / Math.max(words.length, 1);
+  const printable = (t.match(/[\x20-\x7e]/g) || []).length / t.length;
+  return repeatRatio > 0.4 && printable > 0.9;
+}
+
+async function adapterInfo() {
+  if (!navigator.gpu) return { webgpu: false };
+  try {
+    const a = await navigator.gpu.requestAdapter();
+    if (!a) return { webgpu: true, adapter: null };
+    const info = a.info || (a.requestAdapterInfo ? await a.requestAdapterInfo() : {});
+    return {
+      webgpu: true,
+      vendor: info.vendor ?? '', architecture: info.architecture ?? '',
+      description: info.description ?? '', device: info.device ?? '',
+      maxBufferSize: a.limits?.maxBufferSize, maxStorageBufferBindingSize: a.limits?.maxStorageBufferBindingSize,
+    };
+  } catch (e) { return { webgpu: true, adapterError: String(e?.message ?? e) }; }
+}
+
+// Qwen3 supports `/think` and `/no_think` soft switches in the user turn — the simplest
+// robust way to A/B reasoning without fighting the chat-template API across pipeline versions.
+function buildPrompt(text, think) {
+  const sw = think ? ' /think' : ' /no_think';
+  return `<|im_start|>user\n${text}${sw}<|im_end|>\n<|im_start|>assistant\n`;
+}
+
+async function run() {
+  const result = { model: MODEL, dtype: DTYPE, think: THINK, prompt: PROMPT };
+  out.textContent = `model:   ${MODEL}\ndtype:   ${DTYPE}\nthink:   ${THINK}`;
+  const adp = await adapterInfo();
+  result.adapter = adp;
+  log(`webgpu:  ${adp.webgpu}` + (adp.description || adp.architecture || adp.vendor
+        ? `  [${[adp.vendor, adp.architecture, adp.description].filter(Boolean).join(' / ')}]` : ''),
+      adp.webgpu ? 'dim' : 'bad');
+  if (!adp.webgpu) { log('No WebGPU in this browser — cannot run.', 'bad'); window.__result = result; return; }
+  const software = /swiftshader|software|llvmpipe|lavapipe/i.test([adp.description, adp.vendor, adp.architecture].join(' '));
+  if (software) log('⚠ adapter looks like a SOFTWARE rasterizer — verdict NOT representative of real Metal WebGPU', 'warn');
+  result.software = software;
+
+  try {
+    const tLoad = performance.now();
+    const gen = await pipeline('text-generation', MODEL, { device: 'webgpu', dtype: DTYPE });
+    result.loadSec = +((performance.now() - tLoad) / 1000).toFixed(1);
+    log(`loaded:  ${result.loadSec}s`, 'dim');
+
+    await gen('hi', { max_new_tokens: 4, do_sample: false });    // warmup: shader compile
+
+    let ttft = null, sawPrompt = false; const t0 = performance.now();
+    const full = buildPrompt(PROMPT, THINK);
+    const res = await gen(full, {
+      max_new_tokens: MAXNEW, do_sample: false,
+      // transformers.js calls put() first with the PROMPT ids, then one generated token at a
+      // time — skip that first call so TTFT = time to the first *generated* token (incl. prefill).
+      streamer: { put: () => { if (!sawPrompt) { sawPrompt = true; return; } if (ttft === null) ttft = (performance.now() - t0) / 1000; }, end: () => {} },
+    });
+    const dt = (performance.now() - t0) / 1000;
+    const text = (Array.isArray(res) ? res[0].generated_text : res.generated_text) ?? '';
+    const completion = typeof text === 'string' ? text.slice(full.length) : JSON.stringify(text);
+    const n = gen.tokenizer(completion, { add_special_tokens: false }).input_ids.dims.at(-1) || MAXNEW;
+
+    Object.assign(result, {
+      coherent: looksCoherent(completion),
+      ttft: ttft != null ? +ttft.toFixed(2) : null,
+      genSec: +dt.toFixed(2), tokens: n, tokS: +(n / dt).toFixed(1),
+      jsHeapMB: performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1048576) : null,
+      completion: completion.trim(),
+    });
+    log(`\nload ${result.loadSec}s · TTFT ${result.ttft}s · ${result.tokens} tok · ${result.genSec}s · ${result.tokS} tok/s`, 'dim');
+    log(`\noutput: ${completion.trim().slice(0, 400)}`);
+    log(result.coherent
+      ? `\nVERDICT: ${DTYPE} on WebGPU WORKS here ✅  (coherent)`
+      : `\nVERDICT: ${DTYPE} on WebGPU BROKEN here ❌  (incoherent — q4 MatMulNBits suspect)`,
+      result.coherent ? 'ok' : 'bad');
+    await gen.dispose?.();
+  } catch (e) {
+    result.error = String(e?.message ?? e);
+    log('\nERROR: ' + result.error, 'bad');
+  }
+  window.__result = result;
+  window.__done = true;
+}
+
+window.__done = false;
+if (AUTO) run(); else { const b = document.createElement('button'); b.textContent = 'Run'; b.onclick = () => { b.disabled = true; run(); }; document.body.appendChild(b); }
+</script>
+</body>
+</html>
