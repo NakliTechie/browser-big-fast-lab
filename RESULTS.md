@@ -107,8 +107,29 @@ on the agenda.**
 
 **The memory tradeoff (unchanged):** F16-everywhere = fast but heavy. 4B = ~8 GB F16 (fits the 24 GB laptop). **8B F16 ≈ 16 GB → likely OOM** → the **"big AND fast" lever is in-shader q4/q8** (keep weights quantized in GPU like ORT `MatMulNBits` / the LFM2 minified engine) — the headline kernel-rewrite item, and the path to the **4–8 GB-class sweet spot** at reasonable memory.
 
+### In-shader Q8_0 — the memory lever (MEASURED 2026-06-27)
+
+`weightQuant: 'q8'` keeps the 7 big per-layer matmul weights **quantized in GPU**
+(symmetric int8 + one f16 scale per 32-block, re-derived from source at load) and
+dequantizes them inside the GEMV loop, instead of F16-everywhere. lmHead/embeddings/
+norms stay F16. Shader `matmul_q8.wgsl`; committed `903d8f6`.
+
+| Qwen3-1.7B (q4_k_m source) | F16 | **Q8 in-shader** |
+|---|---|---|
+| crossLabDiff logits cosine | 0.99636 | **0.99666** (argmax=Paris ✓) |
+| tps (short / long) | 35.6 / 43.3 | 34.7 / 42.0 (= F16) |
+| layer-weight GPU mem | 2.82 GB | **1.50 GB** (1.88×) |
+| total weight GPU mem | 3.44 GB | **2.12 GB** (1.62×, diluted by tied F16 embed) |
+
+**Near-lossless** (Q8 has headroom over the Q4_K source) and **no speed cost** (GEMV is
+bandwidth-bound → smaller reads offset the unpack ALU). Proves the in-shader-dequant
+architecture end-to-end (load requant → shader → bind groups → dispatch → crossLabDiff).
+**Unblocks 8B on a 24 GB laptop:** ~16 GB F16 → ~9 GB Q8. **Q4_K in-shader (store raw
+super-blocks, 4× vs F16) is the next increment** → the comfortable 4–8B sweet spot.
+
 ### Custom-WGSL raw run log (what we did to get there)
 
 - **2026-06-27** · Gemma 4 E2B (engine-native) · GGUF q4_k_m→F16 · `lab.bench('Hello…',64,runs3)` + default/200 · **25.4 short / 26.3 long tok/s** (runs 25.37–25.43, rock-stable) · load 173 s (3.1 GB, PLE stream dominates). *Purpose: same-machine proxy decider before porting — revealed the handoff's ~250 was Blackwell, not Apple.* Profile: forward 37.3 ms/tok, FFN gate/up 47%, lmHead 13.8%, PLE ~6–7%.
 - **2026-06-27** · Qwen3-1.7B · GGUF q4_k_m→F16 (Unsloth) · first run after port → **degenerate** ("is the model of the model…") at 44.9 tok/s → diagnosed over-sharp softmax → **fixed attention scaling to 1/√head_dim** → re-ran **coherent** ("The capital of France is Paris."). Bench: **43.3 long / 35.6 short tok/s**, TTFT 0.25–0.46 s, tied embeddings, load 65 s.
 - **2026-06-27** · Qwen3-4B · GGUF q4_k_m→F16 (Unsloth) · added untied-LM-head plumbing (this GGUF actually ties) · loaded **~8 GB F16 with no OOM** on the 24 GB laptop · **coherent** ("…Both are corvids, part of the family…") · **~23 tok/s long** (GPU-profile 43.6 ms/tok agrees) · TTFT ~0.9 s · load 125 s (2.5 GB).
+- **2026-06-27** · Qwen3-1.7B · **`weightQuant:'q8'`** (in-shader Q8_0) · loaded clean, **coherent** ("…is Paris. Now, let's create a simple program…") · crossLabDiff logits **0.99666**, argmax=Paris (= F16 quality) · tps 34.7/42.0 (= F16) · weight mem 3.44→2.12 GB. *Purpose: prove the in-shader memory lever. Result: correct + same speed + ~1.9× smaller layer weights.* The decisive design choice — store int8+f16-scale per 32-block, dequant in the GEMV loop; mr4 fast-path disabled for q8 (scalar GEMV).
