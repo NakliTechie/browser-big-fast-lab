@@ -94,16 +94,24 @@
 // ───────────────────────────────────────────────────────────────────────────
 
 const MODELS = [
-  { id: 'onnx-community/Qwen3-0.6B-ONNX', label: 'Qwen3-0.6B (q4f16)', tjs_dtype: 'q4f16' },
-  { id: 'onnx-community/Qwen3-1.7B-ONNX', label: 'Qwen3-1.7B (q4f16)', tjs_dtype: 'q4f16' },
+  { id: 'Qwen3-0.6B', label: 'Qwen3-0.6B', onnx: 'onnx-community/Qwen3-0.6B-ONNX', tjs_dtype: 'q4f16',
+    gguf: 'https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf' },
+  { id: 'Qwen3-1.7B', label: 'Qwen3-1.7B', onnx: 'onnx-community/Qwen3-1.7B-ONNX', tjs_dtype: 'q4f16',
+    gguf: 'https://huggingface.co/unsloth/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf' },
 ];
 
 const LANES = [
-  { key: 'tjs',  name: 'transformers.js', tag: 'ORT + wasm', status: 'idle',
+  { key: 'ours', name: 'custom WGSL engine', tag: 'raw WebGPU · GGUF', status: 'idle',
+    desc: 'Our hand-rolled WGSL engine — GGUF → GPU buffers, in-shader Q4_K / Q8 / F16, no wasm.',
+    extra: `<label style="font-size:11px;color:var(--muted)">quant
+      <select data-quant style="margin-left:4px;padding:3px 6px">
+        <option value="q4k" selected>Q4_K (4-bit)</option>
+        <option value="q8">Q8 (8-bit)</option>
+        <option value="f16">F16</option>
+      </select></label>` },
+  { key: 'tjs',  name: 'transformers.js', tag: 'ONNX · ORT+wasm', status: 'idle',
     desc: "Hugging Face's transformers.js (bundles onnxruntime-web). The off-the-shelf baseline." },
-  { key: 'ours', name: 'custom WGSL engine', tag: 'raw WebGPU', status: 'soon',
-    desc: 'Our hand-rolled WGSL engine — GGUF → GPU, in-shader Q4_K/Q8. Bundling into this page next.' },
-  { key: 'ort',  name: 'raw onnxruntime-web', tag: 'WebGPU EP', status: 'soon',
+  { key: 'ort',  name: 'raw onnxruntime-web', tag: 'ONNX · WebGPU EP', status: 'soon',
     desc: 'Raw ORT-web session (no transformers.js wrapper) — the big-model loader path.' },
   { key: 'lm',   name: 'LocalMind hand-rolled', tag: 'WebGPU', status: 'soon',
     desc: "LocalMind's own minified in-browser engines (gemma-4-e2b.js / lfm2_5.js)." },
@@ -134,6 +142,7 @@ for (const L of LANES) {
       <div class="row">
         <button data-load="${L.key}" ${L.status === 'soon' ? 'disabled' : ''}>Load</button>
         <button data-unload="${L.key}" disabled>Unload</button>
+        ${L.extra || ''}
         ${L.status === 'soon' ? '<span class="pill">wiring in progress</span>' : ''}
       </div>
       <div class="stats"></div>
@@ -144,33 +153,50 @@ for (const L of LANES) {
 }
 
 // ── transformers.js lane ──
-let tjsPipelineFactory = null;
+let tjsMod = null;
 async function ensureTjs() {
-  if (!tjsPipelineFactory) {
+  if (!tjsMod) {
     setStatus('tjs', 'loading transformers.js runtime…');
-    const mod = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.1.1');
-    mod.env.allowLocalModels = false;
-    tjsPipelineFactory = mod.pipeline;
+    tjsMod = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0');
+    tjsMod.env.allowLocalModels = false;
   }
-  return tjsPipelineFactory;
+  return tjsMod;
+}
+
+let createGemmaEngine = null;
+async function ensureOurs() {
+  if (!createGemmaEngine) {
+    setStatus('ours', 'loading engine module…');
+    const mod = await import('./engine/browserlab-engine.js');
+    createGemmaEngine = mod.createGemmaEngine;
+  }
+  return createGemmaEngine;
 }
 
 async function loadLane(key) {
-  const model = modelSel.value;
-  const meta = MODELS.find(m => m.id === model);
+  const meta = MODELS.find(m => m.id === modelSel.value);
   setLaneClass(key, 'loading');
   laneEl(key).querySelector('[data-load]').disabled = true;
   setOut(key, ''); setStats(key, '');
   const t0 = performance.now();
   try {
     if (key === 'tjs') {
-      const pipeline = await ensureTjs();
-      setStatus(key, `loading ${meta.label} on WebGPU…`);
-      const gen = await pipeline('text-generation', model, {
+      const mod = await ensureTjs();
+      setStatus(key, `loading ${meta.label} (ONNX q4f16) on WebGPU…`);
+      const gen = await mod.pipeline('text-generation', meta.onnx, {
         device: 'webgpu', dtype: meta.tjs_dtype,
         progress_callback: (p) => { if (p.status === 'progress' && p.file && p.total) setStatus(key, `↓ ${p.file.split('/').pop()} ${(100*p.loaded/p.total).toFixed(0)}%`); },
       });
-      state[key] = { engine: gen, loaded: true, model };
+      state[key] = { engine: gen, loaded: true, model: meta.id, type: 'tjs' };
+    } else if (key === 'ours') {
+      const create = await ensureOurs();
+      const quant = laneEl(key).querySelector('[data-quant]')?.value || 'q4k';
+      setStatus(key, `loading ${meta.label} (GGUF ${quant}) → GPU…`);
+      const engine = await create({
+        model: meta.gguf, weightQuant: quant,
+        onProgress: (p) => { if (p && p.total) setStatus(key, `${p.status || ''} ${(100*p.loaded/p.total).toFixed(0)}%`); },
+      });
+      state[key] = { engine, loaded: true, model: meta.id, type: 'ours', quant };
     } else {
       throw new Error('lane not wired yet');
     }
@@ -203,22 +229,39 @@ async function runLane(key) {
   setOut(key, ''); setStats(key, ''); setStatus(key, 'generating…');
   try {
     if (key === 'tjs') {
-      let n = 0; const t0 = performance.now(); let firstMs = 0;
-      const out = await s.engine(prompt, {
-        max_new_tokens: maxTok, do_sample: false, return_full_text: false,
-        // stream tokens for a live feel + TTFT
-        callback_function: (beams) => {
-          if (!firstMs) firstMs = performance.now() - t0;
-          n++;
-          const txt = s.engine.tokenizer.decode(beams[0].output_token_ids, { skip_special_tokens: true });
-          setOut(key, txt);
-        },
+      const mod = await ensureTjs();
+      let n = 0, firstMs = 0; const t0 = performance.now();
+      const streamer = new mod.TextStreamer(s.engine.tokenizer, {
+        skip_prompt: true, skip_special_tokens: true,
+        callback_function: (text) => { if (!firstMs) firstMs = performance.now() - t0; n++; appendOut(key, text); },
       });
+      setOut(key, '');
+      await s.engine(prompt, { max_new_tokens: maxTok, do_sample: false, return_full_text: false, streamer });
       const ms = performance.now() - t0;
-      const text = Array.isArray(out) ? (out[0].generated_text || '') : String(out);
-      setOut(key, text);
       const tps = n > 1 ? ((n - 1) / ((ms - firstMs) / 1000)) : (n / (ms / 1000));
       setStats(key, `<b>${tps.toFixed(1)}</b> tok/s · TTFT <b>${(firstMs/1000).toFixed(2)}s</b> · ${n} tok`);
+      setStatus(key, 'done');
+    } else if (key === 'ours') {
+      const eng = s.engine;
+      const tk = eng.tokenizer;
+      const ids = tk.encode(prompt);          // byte-level BPE — no leading BOS for Qwen3
+      eng.resetKVForCapture();
+      const t0 = performance.now();
+      if (ids.length > 1) await eng.prefillBatched(ids.slice(0, -1), 0);
+      let pos = ids.length - 1, cur = ids[ids.length - 1];
+      const gen = [], all = ids.slice();
+      let firstMs = 0;
+      for (let i = 0; i < maxTok; i++) {
+        const nx = await eng.forwardPassAndGetToken(cur, pos, 0, 0.9, 1.0, all);
+        if (!firstMs) firstMs = performance.now() - t0;
+        gen.push(nx); all.push(nx); cur = nx; pos++;
+        setOut(key, tk.decodeTokens(gen));
+        if (nx === 151645 || nx === 151643) break;  // <|im_end|> / <|endoftext|>
+      }
+      const ms = performance.now() - t0;
+      const n = gen.length;
+      const tps = n > 1 ? ((n - 1) / ((ms - firstMs) / 1000)) : (n / (ms / 1000));
+      setStats(key, `<b>${tps.toFixed(1)}</b> tok/s · TTFT <b>${(firstMs/1000).toFixed(2)}s</b> · ${n} tok · ${s.quant}`);
       setStatus(key, 'done');
     }
   } catch (e) {
