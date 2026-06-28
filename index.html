@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>browserlab — in-browser LLM engine comparison</title>
+<meta name="description" content="Load a model once, run it through transformers.js, raw ORT-web, LocalMind's hand-rolled engines, and a custom WGSL engine — side by side, all in your browser." />
+<style>
+  :root {
+    --bg: #0c0d10; --panel: #15171c; --panel2: #1c1f26; --line: #2a2e38;
+    --ink: #e7e9ee; --muted: #9aa3b2; --accent: #6ea8fe; --good: #54d18c;
+    --warn: #e6b85c; --bad: #e06c75; --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  a { color: var(--accent); }
+  header { padding: 22px 24px 10px; border-bottom: 1px solid var(--line); }
+  header h1 { margin: 0 0 4px; font-size: 20px; letter-spacing: .2px; }
+  header h1 .dim { color: var(--muted); font-weight: 400; }
+  header p { margin: 0; color: var(--muted); font-size: 13px; }
+  .wrap { padding: 18px 24px 60px; max-width: 1500px; margin: 0 auto; }
+  .controls { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-end; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; margin-bottom: 18px; }
+  .field { display: flex; flex-direction: column; gap: 4px; }
+  .field label { font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); }
+  select, input, textarea, button { font: inherit; color: var(--ink); background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+  textarea { width: min(520px, 70vw); resize: vertical; min-height: 40px; }
+  button { cursor: pointer; background: #232735; transition: background .15s, border-color .15s; }
+  button:hover:not(:disabled) { background: #2c3242; border-color: #3a4252; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: var(--accent); color: #06101f; border-color: var(--accent); font-weight: 600; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 16px; }
+  .lane { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; display: flex; flex-direction: column; overflow: hidden; }
+  .lane .head { display: flex; align-items: center; gap: 8px; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+  .lane .head .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
+  .lane.ready .head .dot { background: var(--good); }
+  .lane.loading .head .dot { background: var(--warn); animation: pulse 1s infinite; }
+  .lane.error .head .dot { background: var(--bad); }
+  @keyframes pulse { 50% { opacity: .35; } }
+  .lane .head h3 { margin: 0; font-size: 14px; }
+  .lane .head .tag { margin-left: auto; font-size: 10px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px; }
+  .lane .body { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; flex: 1; }
+  .lane .desc { color: var(--muted); font-size: 12px; min-height: 32px; }
+  .lane .row { display: flex; gap: 8px; align-items: center; }
+  .lane .stats { display: flex; gap: 14px; flex-wrap: wrap; font-family: var(--mono); font-size: 12px; }
+  .lane .stats b { color: var(--accent); font-weight: 600; }
+  .lane .status { font-size: 12px; color: var(--muted); font-family: var(--mono); min-height: 16px; }
+  .lane .out { background: #0a0b0e; border: 1px solid var(--line); border-radius: 8px; padding: 10px; font-family: var(--mono); font-size: 12.5px; white-space: pre-wrap; word-break: break-word; min-height: 90px; max-height: 280px; overflow: auto; flex: 1; }
+  .foot { margin-top: 26px; color: var(--muted); font-size: 12px; line-height: 1.7; }
+  .foot code { background: var(--panel2); padding: 1px 5px; border-radius: 4px; font-size: 11.5px; }
+  .pill { display: inline-block; font-size: 10.5px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 1px 7px; margin-left: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>browserlab <span class="dim">— in-browser LLM engine comparison</span></h1>
+  <p>Load a model, run the same prompt through four engines side by side — all client-side, weights fetched from Hugging Face, nothing leaves your tab.</p>
+</header>
+
+<div class="wrap">
+  <div class="controls">
+    <div class="field">
+      <label for="model">Model</label>
+      <select id="model"></select>
+    </div>
+    <div class="field" style="flex:1; min-width: 280px;">
+      <label for="prompt">Prompt</label>
+      <textarea id="prompt">The capital of France is</textarea>
+    </div>
+    <div class="field">
+      <label for="maxtok">Max tokens</label>
+      <input id="maxtok" type="number" value="48" min="1" max="512" style="width: 90px;" />
+    </div>
+    <button id="runAll" class="primary">Run loaded lanes ▶</button>
+    <button id="unloadAll">Unload all</button>
+  </div>
+
+  <div class="grid" id="lanes"></div>
+
+  <div class="foot">
+    <strong>How it works.</strong> Each lane loads the model independently into the browser's WebGPU device and runs a greedy decode of your prompt, reporting tokens/sec.
+    Models are fetched from Hugging Face on first use (cached by the browser afterward). The custom WGSL lane is the engine from
+    <a href="https://github.com/NakliTechie/gemma4-webgpu" target="_blank" rel="noopener">gemma4-webgpu</a> with the Qwen3 port + in-shader Q4_K/Q8;
+    the others are <a href="https://github.com/huggingface/transformers.js" target="_blank" rel="noopener">transformers.js</a>, raw <code>onnxruntime-web</code>, and
+    <a href="https://github.com/NakliTechie/LocalMind" target="_blank" rel="noopener">LocalMind</a>'s hand-rolled engines.
+    Part of <a href="https://github.com/NakliTechie/browser-big-fast-lab" target="_blank" rel="noopener">browser-big-fast-lab</a>.
+  </div>
+</div>
+
+<script type="module">
+// ───────────────────────────────────────────────────────────────────────────
+// browserlab v1 — lane registry + the transformers.js lane wired end-to-end.
+// Other lanes are scaffolded with a clear status; they come online next.
+// Pure static (ESM via CDN) so it deploys with no build step.
+// ───────────────────────────────────────────────────────────────────────────
+
+const MODELS = [
+  { id: 'onnx-community/Qwen3-0.6B-ONNX', label: 'Qwen3-0.6B (q4f16)', tjs_dtype: 'q4f16' },
+  { id: 'onnx-community/Qwen3-1.7B-ONNX', label: 'Qwen3-1.7B (q4f16)', tjs_dtype: 'q4f16' },
+];
+
+const LANES = [
+  { key: 'tjs',  name: 'transformers.js', tag: 'ORT + wasm', status: 'idle',
+    desc: "Hugging Face's transformers.js (bundles onnxruntime-web). The off-the-shelf baseline." },
+  { key: 'ours', name: 'custom WGSL engine', tag: 'raw WebGPU', status: 'soon',
+    desc: 'Our hand-rolled WGSL engine — GGUF → GPU, in-shader Q4_K/Q8. Bundling into this page next.' },
+  { key: 'ort',  name: 'raw onnxruntime-web', tag: 'WebGPU EP', status: 'soon',
+    desc: 'Raw ORT-web session (no transformers.js wrapper) — the big-model loader path.' },
+  { key: 'lm',   name: 'LocalMind hand-rolled', tag: 'WebGPU', status: 'soon',
+    desc: "LocalMind's own minified in-browser engines (gemma-4-e2b.js / lfm2_5.js)." },
+];
+
+const state = {};  // key -> { engine, loaded, model }
+
+// ── DOM scaffold ──
+const modelSel = document.getElementById('model');
+for (const m of MODELS) { const o = document.createElement('option'); o.value = m.id; o.textContent = m.label; modelSel.appendChild(o); }
+const lanesEl = document.getElementById('lanes');
+
+function laneEl(key) { return document.getElementById('lane-' + key); }
+function setLaneClass(key, cls) { const el = laneEl(key); if (el) el.className = 'lane ' + cls; }
+function setStatus(key, msg) { const el = laneEl(key)?.querySelector('.status'); if (el) el.textContent = msg || ''; }
+function setStats(key, html) { const el = laneEl(key)?.querySelector('.stats'); if (el) el.innerHTML = html || ''; }
+function setOut(key, text) { const el = laneEl(key)?.querySelector('.out'); if (el) el.textContent = text || ''; }
+function appendOut(key, text) { const el = laneEl(key)?.querySelector('.out'); if (el) { el.textContent += text; el.scrollTop = el.scrollHeight; } }
+
+for (const L of LANES) {
+  const card = document.createElement('div');
+  card.className = 'lane' + (L.status === 'soon' ? '' : '');
+  card.id = 'lane-' + L.key;
+  card.innerHTML = `
+    <div class="head"><span class="dot"></span><h3>${L.name}</h3><span class="tag">${L.tag}</span></div>
+    <div class="body">
+      <div class="desc">${L.desc}</div>
+      <div class="row">
+        <button data-load="${L.key}" ${L.status === 'soon' ? 'disabled' : ''}>Load</button>
+        <button data-unload="${L.key}" disabled>Unload</button>
+        ${L.status === 'soon' ? '<span class="pill">wiring in progress</span>' : ''}
+      </div>
+      <div class="stats"></div>
+      <div class="status"></div>
+      <div class="out"></div>
+    </div>`;
+  lanesEl.appendChild(card);
+}
+
+// ── transformers.js lane ──
+let tjsPipelineFactory = null;
+async function ensureTjs() {
+  if (!tjsPipelineFactory) {
+    setStatus('tjs', 'loading transformers.js runtime…');
+    const mod = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.1.1');
+    mod.env.allowLocalModels = false;
+    tjsPipelineFactory = mod.pipeline;
+  }
+  return tjsPipelineFactory;
+}
+
+async function loadLane(key) {
+  const model = modelSel.value;
+  const meta = MODELS.find(m => m.id === model);
+  setLaneClass(key, 'loading');
+  laneEl(key).querySelector('[data-load]').disabled = true;
+  setOut(key, ''); setStats(key, '');
+  const t0 = performance.now();
+  try {
+    if (key === 'tjs') {
+      const pipeline = await ensureTjs();
+      setStatus(key, `loading ${meta.label} on WebGPU…`);
+      const gen = await pipeline('text-generation', model, {
+        device: 'webgpu', dtype: meta.tjs_dtype,
+        progress_callback: (p) => { if (p.status === 'progress' && p.file && p.total) setStatus(key, `↓ ${p.file.split('/').pop()} ${(100*p.loaded/p.total).toFixed(0)}%`); },
+      });
+      state[key] = { engine: gen, loaded: true, model };
+    } else {
+      throw new Error('lane not wired yet');
+    }
+    const ms = performance.now() - t0;
+    setLaneClass(key, 'ready');
+    setStatus(key, `ready · loaded in ${(ms/1000).toFixed(1)} s`);
+    laneEl(key).querySelector('[data-unload]').disabled = false;
+  } catch (e) {
+    setLaneClass(key, 'error');
+    setStatus(key, 'error: ' + (e?.message || e));
+    laneEl(key).querySelector('[data-load]').disabled = false;
+  }
+}
+
+async function unloadLane(key) {
+  const s = state[key];
+  if (s?.engine?.dispose) { try { await s.engine.dispose(); } catch {} }
+  state[key] = null;
+  setLaneClass(key, '');
+  setStatus(key, 'unloaded'); setStats(key, ''); setOut(key, '');
+  laneEl(key).querySelector('[data-load]').disabled = false;
+  laneEl(key).querySelector('[data-unload]').disabled = true;
+}
+
+async function runLane(key) {
+  const s = state[key];
+  if (!s?.loaded) return;
+  const prompt = document.getElementById('prompt').value;
+  const maxTok = Math.max(1, Math.min(512, +document.getElementById('maxtok').value || 48));
+  setOut(key, ''); setStats(key, ''); setStatus(key, 'generating…');
+  try {
+    if (key === 'tjs') {
+      let n = 0; const t0 = performance.now(); let firstMs = 0;
+      const out = await s.engine(prompt, {
+        max_new_tokens: maxTok, do_sample: false, return_full_text: false,
+        // stream tokens for a live feel + TTFT
+        callback_function: (beams) => {
+          if (!firstMs) firstMs = performance.now() - t0;
+          n++;
+          const txt = s.engine.tokenizer.decode(beams[0].output_token_ids, { skip_special_tokens: true });
+          setOut(key, txt);
+        },
+      });
+      const ms = performance.now() - t0;
+      const text = Array.isArray(out) ? (out[0].generated_text || '') : String(out);
+      setOut(key, text);
+      const tps = n > 1 ? ((n - 1) / ((ms - firstMs) / 1000)) : (n / (ms / 1000));
+      setStats(key, `<b>${tps.toFixed(1)}</b> tok/s · TTFT <b>${(firstMs/1000).toFixed(2)}s</b> · ${n} tok`);
+      setStatus(key, 'done');
+    }
+  } catch (e) {
+    setLaneClass(key, 'error');
+    setStatus(key, 'error: ' + (e?.message || e));
+  }
+}
+
+lanesEl.addEventListener('click', (e) => {
+  const load = e.target.getAttribute?.('data-load');
+  const unload = e.target.getAttribute?.('data-unload');
+  if (load) loadLane(load);
+  if (unload) unloadLane(unload);
+});
+document.getElementById('runAll').addEventListener('click', () => {
+  for (const L of LANES) if (state[L.key]?.loaded) runLane(L.key);
+});
+document.getElementById('unloadAll').addEventListener('click', () => {
+  for (const L of LANES) if (state[L.key]) unloadLane(L.key);
+});
+
+// WebGPU availability hint
+if (!navigator.gpu) {
+  for (const L of LANES) { setLaneClass(L.key, 'error'); setStatus(L.key, 'WebGPU not available in this browser'); }
+}
+</script>
+</body>
+</html>
