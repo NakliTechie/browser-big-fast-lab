@@ -131,6 +131,13 @@ const MODELS = [
 const LANE_RESOURCE = { ours: 'gguf', tjs: 'onnx', ort: 'onnx', lm: 'lm' };
 function laneSupports(key, meta) { return meta && !!meta[LANE_RESOURCE[key]]; }
 
+// The webml-community kernels lane links out to Xenova's canonical HF Spaces rather
+// than re-hosting them (the Spaces carry no license — we won't re-host unlicensed code).
+const WEBML_SPACE = {
+  'gemma-4-e2b': 'https://huggingface.co/spaces/webml-community/gemma-4-webgpu-kernels',
+  'lfm2_5': 'https://huggingface.co/spaces/webml-community/lfm2-webgpu-kernels',
+};
+
 const LANES = [
   { key: 'ours', name: 'custom WGSL engine', tag: 'raw WebGPU · GGUF', status: 'idle',
     desc: 'Our hand-rolled WGSL engine — GGUF → GPU buffers, in-shader Q4_K / Q8 / F16, no wasm.',
@@ -144,8 +151,8 @@ const LANES = [
     desc: "Hugging Face's transformers.js (bundles onnxruntime-web). The off-the-shelf baseline." },
   { key: 'ort',  name: 'raw onnxruntime-web', tag: 'ONNX · WebGPU EP', status: 'idle',
     desc: 'Raw ORT-web session (no transformers.js wrapper) — same ONNX weights, hand-written KV-cache decode.' },
-  { key: 'lm',   name: 'webml-community kernels', tag: 'WebGPU · hand-WGSL', status: 'soon',
-    desc: "Xenova's hand-written WebGPU kernels (gemma-4 / lfm2 webgpu-kernels Spaces), vendored via LocalMind. Reads QAT-mobile / Q4_0 weights." },
+  { key: 'lm',   name: 'webml-community kernels', tag: 'WebGPU · hand-WGSL', status: 'idle', link: true,
+    desc: "Xenova's hand-written WebGPU kernels (gemma-4 / lfm2). The Spaces carry no license, so rather than re-host them this lane opens Xenova's canonical demo to run side-by-side in another tab." },
 ];
 
 const state = {};  // key -> { engine, loaded, model }
@@ -171,8 +178,8 @@ for (const L of LANES) {
     <div class="body">
       <div class="desc">${L.desc}</div>
       <div class="row">
-        <button data-load="${L.key}" disabled>Load</button>
-        <button data-unload="${L.key}" disabled>Unload</button>
+        <button data-load="${L.key}" disabled>${L.link ? 'Open on 🤗 Space ↗' : 'Load'}</button>
+        ${L.link ? '' : `<button data-unload="${L.key}" disabled>Unload</button>`}
         ${L.extra || ''}
         ${L.status === 'soon' ? '<span class="pill">wiring in progress</span>' : ''}
         <span class="pill na" data-na="${L.key}" style="display:none">n/a for this model</span>
@@ -246,6 +253,12 @@ function argmaxRow(data, off, V, isF16) {
 
 async function loadLane(key) {
   const meta = MODELS.find(m => m.id === modelSel.value);
+  // The webml-community lane links out to Xenova's canonical Space (not re-hosted).
+  if (key === 'lm') {
+    const url = WEBML_SPACE[meta?.lm];
+    if (url) window.open(url, '_blank', 'noopener');
+    return;
+  }
   setLaneClass(key, 'loading');
   laneEl(key).querySelector('[data-load]').disabled = true;
   setOut(key, ''); setStats(key, '');
