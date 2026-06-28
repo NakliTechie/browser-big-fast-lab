@@ -93,12 +93,32 @@
 // Pure static (ESM via CDN) so it deploys with no build step.
 // ───────────────────────────────────────────────────────────────────────────
 
+// Per-lane availability: `gguf` → our WGSL engine (qwen3 / gemma4 arches only);
+// `onnx` → transformers.js + raw ORT-web; `lm` → LocalMind's hand-rolled engine.
+// null where a lane can't run that model (the UI disables it).
+const GGUF = (repo, file) => `https://huggingface.co/${repo}/resolve/main/${file}`;
 const MODELS = [
-  { id: 'Qwen3-0.6B', label: 'Qwen3-0.6B', onnx: 'onnx-community/Qwen3-0.6B-ONNX', tjs_dtype: 'q4f16',
-    gguf: 'https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf' },
-  { id: 'Qwen3-1.7B', label: 'Qwen3-1.7B', onnx: 'onnx-community/Qwen3-1.7B-ONNX', tjs_dtype: 'q4f16',
-    gguf: 'https://huggingface.co/unsloth/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf' },
+  { id: 'Qwen3-0.6B', label: 'Qwen3-0.6B', tjs_dtype: 'q4f16',
+    gguf: GGUF('unsloth/Qwen3-0.6B-GGUF', 'Qwen3-0.6B-Q4_K_M.gguf'), onnx: 'onnx-community/Qwen3-0.6B-ONNX', lm: null },
+  { id: 'Qwen3-1.7B', label: 'Qwen3-1.7B', tjs_dtype: 'q4f16',
+    gguf: GGUF('unsloth/Qwen3-1.7B-GGUF', 'Qwen3-1.7B-Q4_K_M.gguf'), onnx: 'onnx-community/Qwen3-1.7B-ONNX', lm: null },
+  { id: 'Qwen3-4B', label: 'Qwen3-4B', tjs_dtype: 'q4f16',
+    gguf: GGUF('unsloth/Qwen3-4B-GGUF', 'Qwen3-4B-Q4_K_M.gguf'), onnx: 'onnx-community/Qwen3-4B-ONNX', lm: null },
+  { id: 'Qwen3-8B', label: 'Qwen3-8B (ours only)', tjs_dtype: 'q4f16',
+    gguf: GGUF('unsloth/Qwen3-8B-GGUF', 'Qwen3-8B-Q4_K_M.gguf'), onnx: null, lm: null },
+  { id: 'Gemma-4-E2B', label: 'Gemma-4 E2B', tjs_dtype: 'q4f16',
+    gguf: GGUF('unsloth/gemma-4-E2B-it-GGUF', 'gemma-4-E2B-it-Q4_K_M.gguf'), onnx: null, lm: 'gemma-4-e2b' },
+  { id: 'Gemma-4-E4B', label: 'Gemma-4 E4B', tjs_dtype: 'q4f16',
+    gguf: GGUF('unsloth/gemma-4-E4B-it-GGUF', 'gemma-4-E4B-it-Q4_K_M.gguf'), onnx: null, lm: null },
+  { id: 'Gemma-3-270M', label: 'Gemma-3 270M', tjs_dtype: 'q4f16',
+    gguf: null, onnx: 'onnx-community/gemma-3-270m-ONNX', lm: null },
+  { id: 'LFM2-350M', label: 'LFM2 350M', tjs_dtype: 'q4f16',
+    gguf: null, onnx: 'onnx-community/LFM2-350M-ONNX', lm: 'lfm2_5' },
 ];
+
+// Which model resource each lane needs (so we can grey out lanes a model can't run).
+const LANE_RESOURCE = { ours: 'gguf', tjs: 'onnx', ort: 'onnx', lm: 'lm' };
+function laneSupports(key, meta) { return meta && !!meta[LANE_RESOURCE[key]]; }
 
 const LANES = [
   { key: 'ours', name: 'custom WGSL engine', tag: 'raw WebGPU · GGUF', status: 'idle',
@@ -140,10 +160,11 @@ for (const L of LANES) {
     <div class="body">
       <div class="desc">${L.desc}</div>
       <div class="row">
-        <button data-load="${L.key}" ${L.status === 'soon' ? 'disabled' : ''}>Load</button>
+        <button data-load="${L.key}" disabled>Load</button>
         <button data-unload="${L.key}" disabled>Unload</button>
         ${L.extra || ''}
         ${L.status === 'soon' ? '<span class="pill">wiring in progress</span>' : ''}
+        <span class="pill na" data-na="${L.key}" style="display:none">n/a for this model</span>
       </div>
       <div class="stats"></div>
       <div class="status"></div>
@@ -151,6 +172,22 @@ for (const L of LANES) {
     </div>`;
   lanesEl.appendChild(card);
 }
+
+// Grey out lanes the selected model can't run (or that aren't wired yet), unless
+// already loaded. Single source of truth for each lane's Load-button state.
+function refreshAvailability() {
+  const meta = MODELS.find(m => m.id === modelSel.value);
+  for (const L of LANES) {
+    const wired = L.status !== 'soon';
+    const supported = laneSupports(L.key, meta);
+    const loaded = !!(state[L.key] && state[L.key].loaded);
+    const loadBtn = laneEl(L.key)?.querySelector('[data-load]');
+    const naEl = laneEl(L.key)?.querySelector('[data-na]');
+    if (loadBtn) loadBtn.disabled = !wired || !supported || loaded;
+    if (naEl) naEl.style.display = (wired && !supported) ? '' : 'none';
+  }
+}
+modelSel.addEventListener('change', refreshAvailability);
 
 // ── transformers.js lane ──
 let tjsMod = null;
@@ -207,8 +244,8 @@ async function loadLane(key) {
   } catch (e) {
     setLaneClass(key, 'error');
     setStatus(key, 'error: ' + (e?.message || e));
-    laneEl(key).querySelector('[data-load]').disabled = false;
   }
+  refreshAvailability();
 }
 
 async function unloadLane(key) {
@@ -217,8 +254,8 @@ async function unloadLane(key) {
   state[key] = null;
   setLaneClass(key, '');
   setStatus(key, 'unloaded'); setStats(key, ''); setOut(key, '');
-  laneEl(key).querySelector('[data-load]').disabled = false;
   laneEl(key).querySelector('[data-unload]').disabled = true;
+  refreshAvailability();
 }
 
 async function runLane(key) {
@@ -282,6 +319,8 @@ document.getElementById('runAll').addEventListener('click', () => {
 document.getElementById('unloadAll').addEventListener('click', () => {
   for (const L of LANES) if (state[L.key]) unloadLane(L.key);
 });
+
+refreshAvailability();
 
 // WebGPU availability hint
 if (!navigator.gpu) {
