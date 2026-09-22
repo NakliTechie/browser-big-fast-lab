@@ -291,7 +291,7 @@ The complete Unlimited-OCR pipeline runs in one browser tab, no server (`ocr-dem
 - `<image>\n<|grounding|>Convert the document to markdown.` → talks, but recites instruction boilerplate.
 - **`<image>document parsing.`** (this model's README phrasing) → perfect det-boxed transcription in bf16 AND in-browser. *Method note: when a multimodal chain misbehaves, control with the full reference stack on identical input before touching the chain — here it converted a "debug the engine" night into a one-line prompt fix.*
 
-Not done (parked): fp16/quant pass on the 1.6 GB fp32 vision graph (→ ~800 MB; watch the LayerNorm-fp16 converter gotcha), crop-mode multi-tile layout, R-SWA ring KV (P2), HF publish (P3, stop-lined).
+At P1 close (later resolved below): fp16/quant pass on the 1.6 GB fp32 vision graph, crop-mode multi-tile layout, R-SWA ring KV (P2), HF publish (P3, stop-lined).
 
 ### P2 RESULT (overnight autopilot 2026-07-15): **R-SWA ring-KV works — constant-memory long-doc decode, verified 3 ways** ✅
 
@@ -310,15 +310,41 @@ The categorical differentiator is in: the engine decodes **past its own KV alloc
 - Multi-page layout (from `infer_multi`): per page the same 273-token block as single-image (trailing token doubles as separator) — pure concatenation, prompt `<image>Multi page parsing.`
 - **Env gotchas that ate 6 "crash" cycles** (documented for the next overnight): writes into vite-watched dirs reload the page mid-run; `new Image().decode()` on detached images hangs FOREVER in backgrounded tabs (use `createImageBitmap`); 800+ unthrottled GPU submits kill the GPU process (prefill now syncs every 64 — `e2f1aa0`); pdf.js workers never handshake in the embedded preview pane (three strategies, zero errors — vendor same-origin or use real Chrome).
 
-**Parked from this run:** fp16 vision (2 attempts, both die on a pre-existing Cast-retyping converter bug in SAM rel-pos — next: torch-native `.half()` re-export) · real-PDF showpiece (env-blocked above; page committed WIP, chain is the proven P1/P2 path) · batched prefill (declined by design at 2am: M>1 through an M=1-shaped engine is >1 night — sketch in workplan; throttled per-token prefill costs ~30-45 s per 800-token doc).
+**At the overnight close:** fp16 vision and the real-PDF showpiece were parked; both were resolved in the deliberate follow-up below. Batched prefill remains declined by design: M>1 through an M=1-shaped engine is a separate architecture project, while throttled per-token prefill is correct.
 
 **SHIPPED:** merged → `deepseek-ocr` (`5974f0c`) → `main` (`0ca5e3a`), pushed to fork.
+
+### P2 residual closeout (2026-07-28): **native fp16 + real 4-page PDF are GREEN** ✅
+
+The failed post-hoc converters were the wrong layer of attack: both rewrote SAM's existing relative-position Cast chain into an invalid graph. `export_deepencoder_fp16_native.py` instead converts the PyTorch module and selected weights to half **before tracing**, then wraps the module with float32 input/output casts so the browser contract stays unchanged.
+
+| gate | result |
+|---|---|
+| artifact | `deepencoder_fp16.onnx`, **802.7 MB** (fp32 graph was 1.5 GB) |
+| torch native-fp16 vs fp32 fixture | cosine **0.9999908** |
+| ORT fp16 vs torch-fp32 fixture | cosine **0.9999978** |
+| ORT fp16 vs ORT-fp32 real document | cosine **0.9999961**, maxAbs 0.01061 |
+| real-doc patch norms | fp16/fp32 ratio **[0.99032, 1.00239]**, all finite |
+
+The PDF blocker was similarly at the boundary, not in the OCR chain. `pdfjs-dist@4.8.69` is now bundled and Vite emits `pdf.worker.min.mjs?url` as a same-origin worker asset; the CDN/classic-blob/module-port experiments are gone. Live Apple Metal-3 browser gate (`pdf-demo.html`, `maxTokens=640`):
+
+| stage/result | measurement |
+|---|---|
+| input/render | real **4-page** `annual_letter.pdf`; 4 canvases rendered |
+| fp16 DeepEncoder | all 4 pages in **7.9 s** total on ORT-web WebGPU |
+| ring decode | **639 tokens**, natural EOS, **18.5 s / 34.6 tok/s** |
+| constant-memory proof | P=1097, KV cap **1225 = P+128** |
+| OCR output | **4 `<PAGE>` blocks**, every heading/body line/page number content-exact |
+| full run | **80.1 s** including model load, render, vision, prefill, decode |
+
+ORT emits non-fatal session-optimization warnings because its CPU constant folder has no fp16 `Sqrt` kernel; the WebGPU session loads, runs, and passes the end-to-end content gate.
 
 ### T7 raw run log
 
 - **2026-07-14** · recon day (all findings above) · GGUF headers parsed byte-level via ranged fetch (`deepseek-ocr-spike/gguf_header.py`) · Q4_K_M + mmproj downloaded to `deepseek-ocr-spike/models/` (main checkout).
 - **2026-07-14** · **P0 opened** on `custom-kernels` branch `deepseek-ocr` · **Q5_0 source dequant added + verified**: `blk.1.ffn_down_exps.weight` (real Q5_0 tensor, 262,144 elems) TS-vs-python-`gguf` reference — **0 mismatches >1e-7** (commit `92e52b6`, harness `scripts/check_q5_0.{mjs,py}`). Loader now covers every quant in the Q4_K_M file.
 - **2026-07-14 overnight** · P0 executed end-to-end on autopilot: config/types/loader/kernels/forward (`6c9ff7e`, typecheck ✓) · CPU reference `deepseek_ocr_smoke.py` (bf16, transformers 4.46.3 pinned env, language-only load 2234 tensors missing=0; top next-token ' the' +22.125) (`eb39f8c`) · tokens matched after the BOS fix (`bdb6d08`) · crossLabDiff sweep green (table above) · argmax 270 = reference · greedy parity with bf16 behavior · bench 125.4 tok/s / TTFT 184 ms / load 31.5 s. *Method note: the bf16-reference greedy run was the decisive control for "is the looping our bug or the model" — reference loops the same way on free text.*
+- **2026-07-28 deliberate closeout** · native-half DeepEncoder export GREEN (802.7 MB; fixture/doc cosine 0.9999978/0.9999961) · bundled same-origin pdf.js worker clears the old handshake hang · real four-page PDF e2e GREEN (4 exact page blocks; 639 tokens to EOS; P=1097; KV cap=1225; vision 7.9 s; decode 18.5 s / 34.6 tok/s; total 80.1 s).
 
 ### Caveats / watch items
 
